@@ -1,0 +1,29 @@
+# --- System & IDE Files ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# --- Rust (Backend) ---
+# The build directory (Huge!)
+backend/target/
+
+# The database file (User data should never be in Git)
+backend/history.json
+
+# --- React (Frontend) ---
+# The dependency folder (Huge!)
+frontend/node_modules/
+
+# The production build output
+frontend/dist/
+
+# Local environment variables (Security risk)
+frontend/.env
+frontend/.env.local
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

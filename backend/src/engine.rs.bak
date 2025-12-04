@@ -1,0 +1,162 @@
+use reqwest::header::RANGE;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::{Mutex, Semaphore};
+
+// Standard location: {User}/Downloads/FF/
+pub fn get_download_dir() -> PathBuf {
+    let base_dirs = directories::UserDirs::new().expect("Could not find user directories");
+    let mut path = base_dirs
+        .download_dir()
+        .expect("No download dir")
+        .to_path_buf();
+    path.push("FF");
+    path
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadTask {
+    pub id: String,
+    pub url: String,
+    pub filename: String,
+    pub total_size: Option<u64>,
+    pub downloaded_bytes: u64,
+    pub status: DownloadStatus,
+    pub save_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum DownloadStatus {
+    Pending,
+    Downloading,
+    Paused,
+    Completed,
+    Error(String),
+}
+
+// The heavy lifter
+pub async fn start_multistream_download(
+    url: String,
+    task_id: String,
+    state_updater: Arc<Mutex<Vec<DownloadTask>>>,
+) -> Result<(), String> {
+    // 1. Resolve path and create directory
+    let ff_dir = get_download_dir();
+    tokio::fs::create_dir_all(&ff_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Naive filename extraction for MVP
+    let filename = url.split('/').last().unwrap_or("download.bin").to_string();
+    let file_path = ff_dir.join(&filename);
+
+    // 2. Head Request to check size and ranges
+    let client = reqwest::Client::new();
+    let head = client.head(&url).send().await.map_err(|e| e.to_string())?;
+
+    let content_length = head
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|ct| ct.to_str().ok())
+        .and_then(|ct| ct.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let accepts_ranges = head
+        .headers()
+        .get(reqwest::header::ACCEPT_RANGES)
+        .map(|v| v == "bytes")
+        .unwrap_or(false);
+
+    // 3. Initialize File
+    let mut file = tokio::fs::File::create(&file_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    file.set_len(content_length)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 4. Update State to Downloading
+    {
+        let mut tasks = state_updater.lock().await;
+        if let Some(task) = tasks.iter_mut().find(|t| t.id == task_id) {
+            task.status = DownloadStatus::Downloading;
+            task.total_size = Some(content_length);
+            task.save_path = file_path.to_string_lossy().to_string();
+        }
+    }
+
+    // 5. Strategy Selection
+    if accepts_ranges && content_length > 0 {
+        // --- MULTI STREAM STRATEGY ---
+        println!("Starting multi-stream download for {}", filename);
+
+        let chunk_count = 8; // MVP: Fixed 8 streams
+        let chunk_size = content_length / chunk_count;
+        let mut handles = vec![];
+
+        // Use a semaphore to limit concurrent HTTP connections if we scale up
+        let sem = Arc::new(Semaphore::new(chunk_count as usize));
+
+        for i in 0..chunk_count {
+            let start = i * chunk_size;
+            let end = if i == chunk_count - 1 {
+                content_length - 1
+            } else {
+                (i + 1) * chunk_size - 1
+            };
+
+            let url_clone = url.clone();
+            let path_clone = file_path.clone();
+            let sem_clone = sem.clone();
+
+            let handle = tokio::spawn(async move {
+                let _permit = sem_clone.acquire().await.unwrap();
+                let client = reqwest::Client::new();
+                let response = client
+                    .get(&url_clone)
+                    .header(RANGE, format!("bytes={}-{}", start, end))
+                    .send()
+                    .await
+                    .unwrap();
+
+                let bytes = response.bytes().await.unwrap();
+
+                // Open file individually per thread to avoid lock contention on a shared file handle
+                // Windows handles concurrent writes fine as long as offsets don't overlap
+                let mut file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path_clone)
+                    .await
+                    .unwrap();
+
+                file.seek(tokio::io::SeekFrom::Start(start)).await.unwrap();
+                file.write_all(&bytes).await.unwrap();
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all chunks
+        for h in handles {
+            let _ = h.await;
+        }
+    } else {
+        // --- SINGLE STREAM FALLBACK ---
+        println!("Falling back to single stream for {}", filename);
+        let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        file.write_all(&bytes).await.map_err(|e| e.to_string())?;
+    }
+
+    // 6. Finalize
+    {
+        let mut tasks = state_updater.lock().await;
+        if let Some(task) = tasks.iter_mut().find(|t| t.id == task_id) {
+            task.status = DownloadStatus::Completed;
+            task.downloaded_bytes = content_length;
+        }
+    }
+
+    Ok(())
+}
